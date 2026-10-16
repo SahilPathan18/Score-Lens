@@ -493,6 +493,13 @@ def _parse_format1(pages: list[str], full_text: str, pdf_path: str | Path) -> tu
                     break
 
         def _parse_token(t: str) -> tuple[int | None, int | None]:
+            if "+" in t:
+                parts = t.split("+", 1)
+                n1 = re.findall(r"\d{1,3}", parts[0])
+                n2 = re.findall(r"\d{1,3}", parts[1])
+                v1 = int(n1[0]) if n1 else None
+                v2 = int(n2[0]) if n2 else None
+                return v1, v2
             nums = re.findall(r"\d{1,3}", t)
             if len(nums) >= 2:
                 return int(nums[0]), int(nums[1])
