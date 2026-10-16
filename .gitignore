@@ -31,3 +31,7 @@ debug_*.py
 
 # PDF test files (don't commit large PDFs)
 *.pdf
+
+# Promo / media generation output
+brag-output/
+
