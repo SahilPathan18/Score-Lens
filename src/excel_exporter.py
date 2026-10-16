@@ -5,7 +5,7 @@ Bangalore University departmental ledger format:
 - Institutional & Examination Headers
 - Multi-tier Subject Headers (Subject name, SEE/IA breakdown)
 - Student Data Grid with automated Excel formulas for totals and percentages
-- Visual pass/fail highlighting (soft green / soft red)
+- Visual pass/fail/absent highlighting (soft green / soft red / soft orange)
 - Subject-wise Result Analysis table with dynamic pass rates
 - Overall Class Result Summary with grade tier segmentation (Distinction, First Class, etc.)
 """
@@ -25,8 +25,33 @@ CLR_PASS_BG = "C6EFCE"     # Soft green fill for passed subjects
 CLR_PASS_FG = "006100"     # Dark green text
 CLR_FAIL_BG = "FFC7CE"     # Soft red fill for failed subjects
 CLR_FAIL_FG = "9C0006"     # Dark red text
+CLR_ABSENT_BG = "F8CBAD"   # Soft orange fill for absent subjects
+CLR_ABSENT_FG = "C65911"   # Dark orange text
 CLR_BORDER = "B7B7B7"      # Clean thin grid border
 CLR_WHITE = "FFFFFF"
+
+
+def _is_absent(sub_rec: dict | None, student: dict | None = None) -> bool:
+    """Check if the student is absent in this subject."""
+    if not sub_rec:
+        return False
+    status = str(sub_rec.get("status") or "").strip().upper()
+    if status in ("ABSENT", "AB", "A") or "ABSENT" in status:
+        return True
+    res = str(sub_rec.get("result") or "").strip().upper()
+    if res in ("ABSENT", "AB", "A") or "ABSENT" in res:
+        return True
+    if sub_rec.get("is_absent") is True:
+        return True
+    for k in ("theory", "internal", "total"):
+        val = str(sub_rec.get(k) or "").strip().upper()
+        if val in ("AB", "ABSENT", "A"):
+            return True
+    if student:
+        stu_res = str(student.get("result") or "").strip().upper()
+        if stu_res in ("ABSENT", "AB") and status != "PASS" and res != "PASS":
+            return True
+    return False
 
 
 def _get_short_code(code: str) -> str:
@@ -121,11 +146,13 @@ def _render_analysis_sheet(ws, meta: dict, courses: list[dict], students: list[d
     font_data_bold = Font(name="Calibri", size=11, bold=True)
     font_pass = Font(name="Calibri", size=11, bold=True, color=CLR_PASS_FG)
     font_fail = Font(name="Calibri", size=11, bold=True, color=CLR_FAIL_FG)
+    font_absent = Font(name="Calibri", size=11, bold=True, color=CLR_ABSENT_FG)
 
     fill_navy = PatternFill("solid", fgColor=CLR_NAVY)
     fill_blue = PatternFill("solid", fgColor=CLR_BLUE)
     fill_pass = PatternFill("solid", fgColor=CLR_PASS_BG)
     fill_fail = PatternFill("solid", fgColor=CLR_FAIL_BG)
+    fill_absent = PatternFill("solid", fgColor=CLR_ABSENT_BG)
 
     thin_border = Border(
         left=Side(style="thin", color=CLR_BORDER),
@@ -276,11 +303,20 @@ def _render_analysis_sheet(ws, meta: dict, courses: list[dict], students: list[d
                 continue
 
             sub_rec = s.get("subjects", {}).get(code, {})
-            status = sub_rec.get("status", "PASS")
-            failed_sub = status == "FAIL"
+            is_absent_sub = _is_absent(sub_rec, s)
+            status = str(sub_rec.get("status") or "").strip().upper()
+            sub_res = str(sub_rec.get("result") or "").strip().upper()
+            failed_sub = not is_absent_sub and (status == "FAIL" or sub_res == "FAIL")
 
-            fill_sub = fill_fail if failed_sub else fill_pass
-            font_sub = font_fail if failed_sub else font_data
+            if is_absent_sub:
+                fill_sub = fill_absent
+                font_sub = font_absent
+            elif failed_sub:
+                fill_sub = fill_fail
+                font_sub = font_fail
+            else:
+                fill_sub = fill_pass
+                font_sub = font_data
 
             col1 = start_sub_col + (i * 3)
             col2 = col1 + 1
@@ -343,6 +379,9 @@ def _render_analysis_sheet(ws, meta: dict, courses: list[dict], students: list[d
         if res_val == "PASS":
             c_res.fill = fill_pass
             c_res.font = font_pass
+        elif res_val in ("ABSENT", "AB") or "ABSENT" in res_val:
+            c_res.fill = fill_absent
+            c_res.font = font_absent
         else:
             c_res.fill = fill_fail
             c_res.font = font_fail
