@@ -6,6 +6,8 @@ A high-performance, 100% offline desktop application built to parse, analyze, an
 [![UI-CustomTkinter](https://img.shields.io/badge/UI-CustomTkinter-2e8b57)](https://github.com/TomSchimansky/CustomTkinter)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)](https://github.com/SahilPathan18/Score-Lens)
 
+![Score-Lens Dashboard Preview](assets/dashboard_preview.png)
+
 ---
 
 ## Features
