@@ -1,4 +1,4 @@
-# College Result Analyser
+# Score-Lens
 
 A high-performance, 100% offline desktop application built to parse, analyze, and visualize Bangalore University Tabulation Register PDF ledgers. Upload a university marksheet ledger to generate an interactive analytics dashboard featuring student rankings, subject-level breakdowns, statistical grade distributions, and multi-sheet Excel exports.
 
