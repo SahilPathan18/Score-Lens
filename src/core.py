@@ -21,7 +21,17 @@ else:
     BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "output"
 
-USN_RE = re.compile(r"\bU\d{2}[A-Z0-9]{1,6}\d{2}[A-Z0-9]{3,}\b", re.I)
+USN_RE = re.compile(
+    r"\b("
+    r"U\d{2}[A-Z0-9]{1,6}\d{2}[A-Z0-9]{3,}|"  # Standard BU/VTU USN (e.g. U03LX23S0001)
+    r"\d{2}[A-Z]{2,}\d{4,}|"                  # State university format (e.g. 21BCA0001)
+    r"\d{7,14}|"                              # Numeric roll no (e.g. 21044570001, 12104562)
+    r"[A-Za-z]{2,5}\d{4,10}|"                 # Prefix alphanumeric (e.g. BCA2021001)
+    r"[A-Za-z0-9]{2,6}[/-][A-Za-z0-9]{1,6}[/-][A-Za-z0-9]{2,8}" # Slashed/hyphenated IDs (e.g. 21/BCA/042)
+    r")\b",
+    re.I,
+)
+UNIVERSAL_ID_RE = USN_RE
 NUMBER_RE = re.compile(r"\b\d{1,3}\b")
 
 
@@ -60,8 +70,16 @@ def _extract_usn_year(usn: str) -> str | None:
     m = re.search(r"U\d{2}[A-Za-z]{1,4}(\d{2})", usn)
     if m:
         return m.group(1)
-    # Prefix year format: 21BCA001
-    m = re.search(r"^(\d{2})[A-Za-z]+", usn)
+    # Prefix year format: 21BCA001 or 21/BCA/042
+    m = re.search(r"^(\d{2})[A-Za-z/]+", usn)
+    if m:
+        return m.group(1)
+    # 4-digit embedded year: CS-2023-101
+    m = re.search(r"(?:20)(\d{2})", usn)
+    if m:
+        return m.group(1)
+    # Numeric roll number with year prefix (e.g. 21044570001)
+    m = re.search(r"^([12]\d)\d{5,}$", usn)
     if m:
         return m.group(1)
     # Embedded 2-digit batch year: 22BCO101
@@ -290,6 +308,196 @@ def _parse_format2(pages: list[str], pdf_path: str | Path) -> tuple[dict, list[s
     }, warnings
 
 
+def _parse_format_grid_table(doc: pymupdf.Document, pdf_path: str | Path) -> tuple[dict, list[str]]:
+    """Geometry-aware matrix parser using native PyMuPDF table extraction."""
+    warnings: list[str] = []
+
+    # 1. Collect table rows across all pages
+    all_extracted_tables = []
+    for page in doc:
+        try:
+            tab_finder = page.find_tables()
+            for t in tab_finder.tables:
+                extracted = t.extract()
+                if extracted and len(extracted) >= 2:
+                    all_extracted_tables.append(extracted)
+        except Exception:
+            continue
+
+    if not all_extracted_tables:
+        raise AnalysisError("No structured table matrices detected in document.")
+
+    # 2. Identify header row and classify columns
+    header_mapping = None
+    header_row_idx = 0
+    primary_table = all_extracted_tables[0]
+
+    for r_idx, row in enumerate(primary_table[:5]):
+        mapping = {"id": None, "name": None, "total": None, "result": None, "sgpa": None, "cgpa": None, "subjects": []}
+        for c_idx, cell in enumerate(row):
+            val = (cell or "").lower().strip().replace("\n", " ")
+            if any(k in val for k in ["usn", "reg", "roll", "seat", "enroll", "student id", "hall ticket", "prn", "ht no"]):
+                mapping["id"] = c_idx
+            elif any(k in val for k in ["name", "student", "candidate"]) and not any(k in val for k in ["father", "college", "institute"]):
+                mapping["name"] = c_idx
+            elif any(k in val for k in ["grand total", "total marks", "tot marks", "total"]):
+                mapping["total"] = c_idx
+            elif any(k in val for k in ["result", "status", "remarks"]):
+                mapping["result"] = c_idx
+            elif "sgpa" in val or "gpa" in val or "spi" in val:
+                mapping["sgpa"] = c_idx
+            elif "cgpa" in val or "cpi" in val:
+                mapping["cgpa"] = c_idx
+            elif len(val) >= 2 and not any(k in val for k in ["sl", "s.no", "sr.", "sr no", "serial"]):
+                clean_title = re.sub(r"\s+", " ", cell or "").strip()
+                if clean_title:
+                    mapping["subjects"].append((c_idx, clean_title))
+
+        if mapping["id"] is not None and mapping["subjects"]:
+            header_mapping = mapping
+            header_row_idx = r_idx
+            break
+
+    if not header_mapping or header_mapping["id"] is None:
+        raise AnalysisError("Table columns could not be classified into student roll numbers and subjects.")
+
+    # 3. Extract student records across all tables
+    records = []
+    seen_courses = {title: title for _, title in header_mapping["subjects"]}
+
+    for t_idx, table in enumerate(all_extracted_tables):
+        start_row = (header_row_idx + 1) if t_idx == 0 else 0
+        for row in table[start_row:]:
+            if not row or len(row) <= header_mapping["id"]:
+                continue
+
+            id_cell = str(row[header_mapping["id"]] or "").strip()
+            id_match = USN_RE.search(id_cell)
+            if not id_match:
+                continue
+
+            usn = id_match.group(1).upper()
+
+            # Name
+            name = ""
+            if header_mapping["name"] is not None and header_mapping["name"] < len(row):
+                name = clean_name(str(row[header_mapping["name"]] or ""))
+
+            # Subjects
+            subjects_data = {}
+            row_marks = []
+            row_has_fail = False
+
+            for col_idx, sub_name in header_mapping["subjects"]:
+                if col_idx < len(row):
+                    cell_val = str(row[col_idx] or "").strip()
+                    nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", cell_val)]
+                    tot = nums[-1] if nums else None
+                    if tot is not None:
+                        row_marks.append(tot)
+
+                    is_fail = "F" in cell_val.upper() or (tot is not None and tot < 35)
+                    is_abs = "AB" in cell_val.upper() or cell_val.strip().upper() == "A"
+                    if is_fail:
+                        row_has_fail = True
+
+                    stat = "ABSENT" if is_abs else ("FAIL" if is_fail else "PASS")
+                    subjects_data[sub_name] = {
+                        "theory": nums[0] if len(nums) > 1 else None,
+                        "internal": nums[1] if len(nums) > 2 else None,
+                        "total": tot,
+                        "status": stat,
+                    }
+
+            # Overall Total
+            grand_total = None
+            if header_mapping["total"] is not None and header_mapping["total"] < len(row):
+                tot_str = str(row[header_mapping["total"]] or "")
+                nums = re.findall(r"\b\d{2,4}\b", tot_str)
+                if nums:
+                    grand_total = int(nums[0])
+            if grand_total is None and row_marks:
+                grand_total = sum(row_marks)
+
+            max_tot = len(header_mapping["subjects"]) * 100 if header_mapping["subjects"] else 600
+            pct = round(grand_total / max_tot * 100, 2) if grand_total and max_tot else None
+
+            # Result
+            overall_res = "FAIL" if row_has_fail else "PASS"
+            if header_mapping["result"] is not None and header_mapping["result"] < len(row):
+                res_val = str(row[header_mapping["result"]] or "").upper()
+                if "PASS" in res_val:
+                    overall_res = "PASS"
+                elif "FAIL" in res_val:
+                    overall_res = "FAIL"
+                elif "ABSENT" in res_val:
+                    overall_res = "ABSENT"
+
+            # SGPA / CGPA
+            sgpa = None
+            if header_mapping["sgpa"] is not None and header_mapping["sgpa"] < len(row):
+                sgpa_m = re.search(r"[\d.]+", str(row[header_mapping["sgpa"]] or ""))
+                if sgpa_m:
+                    try:
+                        sgpa = float(sgpa_m.group(0))
+                    except ValueError:
+                        pass
+
+            cgpa = None
+            if header_mapping["cgpa"] is not None and header_mapping["cgpa"] < len(row):
+                cgpa_m = re.search(r"[\d.]+", str(row[header_mapping["cgpa"]] or ""))
+                if cgpa_m:
+                    try:
+                        cgpa = float(cgpa_m.group(0))
+                    except ValueError:
+                        pass
+
+            records.append({
+                "serial": str(len(records) + 1),
+                "usn": usn,
+                "name": name,
+                "subjects": subjects_data,
+                "total": grand_total,
+                "max_total": max_tot,
+                "percentage": pct,
+                "result": overall_res,
+                "sgpa": sgpa,
+                "cgpa": cgpa,
+                "grade": None,
+                "year_type": "Current Year",
+            })
+
+    if not records:
+        raise AnalysisError("No student records extracted from table matrix.")
+
+    _tag_year_cohorts(records)
+
+    # 4. Metadata from Page 1
+    p1_text = doc[0].get_text("text") if len(doc) > 0 else ""
+    prog_m = re.search(r"(?:Program|Course|Degree|Branch)\s*[:\-]?\s*(.*?)(?=\n\s*(?:Semester|Exam|Date)|$)", p1_text, re.I)
+    sem_m = re.search(r"Semester\s*[:\-]?\s*([A-Za-z0-9]+)", p1_text, re.I)
+    exam_m = re.search(r"Exam(?:ination)?\s*(?:Month|Date)?\s*[:\-]?\s*([A-Za-z0-9/]+)", p1_text, re.I)
+    uni_m = re.search(r"^(.*(?:University|College|Institute|Academy).*)$", p1_text, re.M | re.I)
+
+    meta = {
+        "university": uni_m.group(1).strip() if uni_m else "University / Institution",
+        "program": " ".join(prog_m.group(1).split()) if prog_m else "Degree Program",
+        "semester": sem_m.group(1).strip() if sem_m else "",
+        "exam_month": exam_m.group(1).strip() if exam_m else "",
+    }
+
+    courses = [{"sl_no": i + 1, "code": c, "name": n} for i, (c, n) in enumerate(seen_courses.items())]
+
+    return {
+        "metadata": meta,
+        "courses": courses,
+        "records": records,
+        "warnings": warnings,
+        "filename": Path(pdf_path).name,
+        "format_type": "Structured Grid Matrix",
+    }, warnings
+
+
 def parse_pdf_data(pdf_path: str | Path) -> tuple[dict, list[str]]:
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -306,47 +514,51 @@ def parse_pdf_data(pdf_path: str | Path) -> tuple[dict, list[str]]:
         doc.close()
         raise AnalysisError("The selected PDF document contains no pages.")
 
-    pages = [page.get_text("text") for page in doc]
-    doc.close()
+    try:
+        pages = [page.get_text("text") for page in doc]
+        full_text = "\n".join(pages)
+        if not full_text.strip():
+            raise AnalysisError("The PDF document contains no readable text.")
 
-    full_text = "\n".join(pages)
-    if not full_text.strip():
-        raise AnalysisError("The PDF document contains no readable text.")
+        # Multi-format detection with automated fallback:
+        is_f2 = bool(re.search(r"Candidate Details", full_text, re.I) or re.search(r"USN:\s*[A-Za-z0-9]+", full_text))
+        is_f1 = bool(re.search(r"Tabulation Register", full_text, re.I) or re.search(r"(?m)^\s*\d{4,5}\s*$", full_text))
 
-    # Multi-format detection with automated fallback:
-    is_f2 = bool(re.search(r"Candidate Details", full_text, re.I) or re.search(r"USN:\s*[A-Za-z0-9]+", full_text))
-    is_f1 = bool(re.search(r"Tabulation Register", full_text, re.I) or re.search(r"(?m)^\s*\d{4,5}\s*$", full_text))
+        if is_f2 and not is_f1:
+            strategies = [
+                ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
+                ("Structured Grid Matrix", lambda: _parse_format_grid_table(doc, pdf_path)),
+                ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
+                ("Universal Adaptive Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
+            ]
+        elif is_f1 and not is_f2:
+            strategies = [
+                ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
+                ("Structured Grid Matrix", lambda: _parse_format_grid_table(doc, pdf_path)),
+                ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
+                ("Universal Adaptive Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
+            ]
+        else:
+            strategies = [
+                ("Structured Grid Matrix", lambda: _parse_format_grid_table(doc, pdf_path)),
+                ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
+                ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
+                ("Universal Adaptive Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
+            ]
 
-    if is_f2 and not is_f1:
-        strategies = [
-            ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
-            ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
-            ("Universal Tabular Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
-        ]
-    elif is_f1 and not is_f2:
-        strategies = [
-            ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
-            ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
-            ("Universal Tabular Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
-        ]
-    else:
-        strategies = [
-            ("UUCMS / NEP Tabulation Ledger", lambda: _parse_format2(pages, pdf_path)),
-            ("Legacy Tabulation Register", lambda: _parse_format1(pages, full_text, pdf_path)),
-            ("Universal Tabular Sheet", lambda: _parse_format_universal(pages, full_text, pdf_path)),
-        ]
+        errors = []
+        for fmt_name, parser in strategies:
+            try:
+                bundle, warnings = parser()
+                if bundle and bundle.get("records"):
+                    return bundle, warnings
+            except Exception as err:
+                errors.append(f"[{fmt_name}] {err}")
+                continue
 
-    errors = []
-    for fmt_name, parser in strategies:
-        try:
-            bundle, warnings = parser()
-            if bundle and bundle.get("records"):
-                return bundle, warnings
-        except Exception as err:
-            errors.append(f"[{fmt_name}] {err}")
-            continue
-
-    raise AnalysisError(f"Unable to extract student records from this PDF format.\nAttempted parsers:\n" + "\n".join(errors))
+        raise AnalysisError(f"Unable to extract student records from this PDF format.\nAttempted parsers:\n" + "\n".join(errors))
+    finally:
+        doc.close()
 
 
 def _parse_format1(pages: list[str], full_text: str, pdf_path: str | Path) -> tuple[dict, list[str]]:
@@ -679,8 +891,8 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
         "exam_month": exam_m.group(1).strip() if exam_m else "",
     }
 
-    # 2. Extract USNs across the document
-    usn_matches = list(re.finditer(r"\b(U\d{2}[A-Z0-9]{6,14}|\d{2}[A-Z]{2,}\d{4,})\b", full_text, re.I))
+    # 2. Extract Roll Numbers across the document
+    usn_matches = list(UNIVERSAL_ID_RE.finditer(full_text))
     if not usn_matches:
         raise AnalysisError("No valid register numbers or student records found in the document.")
 
@@ -693,11 +905,11 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
         end = usn_matches[i + 1].start() if i + 1 < len(usn_matches) else len(full_text)
         block = full_text[start:end]
 
-        name_m = re.search(r"(?:Name|Student|Candidate)\s*[:\-]?\s*([A-Za-z\s.]{3,35})(?=\n|$)", block, re.I)
+        name_m = re.search(r"(?:Name|Student|Candidate)\s*[:\-]?\s*([A-Za-z\s.]{3,40})(?=\n|$)", block, re.I)
         name = clean_name(name_m.group(1)) if name_m else ""
 
-        sgpa_m = re.search(r"SGPA\s*[:\-]?\s*([\d.]+)", block, re.I)
-        cgpa_m = re.search(r"CGPA\s*[:\-]?\s*([\d.]+)", block, re.I)
+        sgpa_m = re.search(r"(?:SGPA|GPA|SPI)\s*[:\-]?\s*([\d.]+)", block, re.I)
+        cgpa_m = re.search(r"(?:CGPA|CPI)\s*[:\-]?\s*([\d.]+)", block, re.I)
         sgpa = float(sgpa_m.group(1)) if sgpa_m else None
         cgpa = float(cgpa_m.group(1)) if cgpa_m else None
 
@@ -706,12 +918,14 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
 
         subjects_data = {}
         for line in block.splitlines():
-            m_sub = re.search(r"\b([A-Z0-9]{3,}-[A-Z0-9\-]+|[A-Z]{3,}\d+[A-Z0-9]*)\b", line)
+            m_sub = re.search(r"\b([A-Z0-9]{3,}-[A-Z0-9\-]+|[A-Z]{2,}\d+[A-Z0-9]*|[A-Z][A-Za-z\s]{3,24})\b", line)
             m_marks = re.findall(r"\b\d{1,3}\b", line)
             if m_sub and len(m_marks) >= 2:
-                c_code = m_sub.group(1)
+                c_code = m_sub.group(1).strip()
                 sub_tot = int(m_marks[-1])
-                sub_stat = "PASS" if "FAIL" not in line.upper() else "FAIL"
+                sub_stat = "PASS" if "FAIL" not in line.upper() and sub_tot >= 35 else "FAIL"
+                if "AB" in line.upper() or line.strip().endswith(" A"):
+                    sub_stat = "ABSENT"
                 seen_courses[c_code] = c_code
                 subjects_data[c_code] = {
                     "theory": int(m_marks[0]) if len(m_marks) > 2 else None,
@@ -745,6 +959,8 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
     if not records:
         raise AnalysisError("Could not extract student records with universal strategy.")
 
+    _tag_year_cohorts(records)
+
     courses = [{"sl_no": i + 1, "code": c, "name": n} for i, (c, n) in enumerate(seen_courses.items())]
 
     return {
@@ -753,7 +969,7 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
         "records": records,
         "warnings": warnings,
         "filename": Path(pdf_path).name,
-        "format_type": "Universal Scorecard / Tabular Sheet",
+        "format_type": "Universal Adaptive Sheet",
     }, warnings
 
 

@@ -176,18 +176,11 @@ def _ctkimg(path: str, w: int, h: int) -> ctk.CTkImage:
 
 @lru_cache(maxsize=None)
 def _logo_pil() -> Image.Image:
-    """logo.png has opaque black corners; the web UI hid them with border-radius (~19 %)."""
-    from PIL import ImageDraw
-    im = _pil(str(ASSETS / "logo.png")).copy()
-    n = im.width
-    mask = Image.new("L", (n, n), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, n - 1, n - 1), radius=int(n * 0.19), fill=255)
-    im.putalpha(mask)
-    return im.resize((256, 256), Image.LANCZOS)
+    return _pil(str(ASSETS / "logo.png")).resize((256, 256), Image.LANCZOS)
 
 
 def logo(size: int, rounded: bool = True) -> ctk.CTkImage:
-    im = _logo_pil() if rounded else _pil(str(ASSETS / "logo.png")).resize((256, 256), Image.LANCZOS)
+    im = _logo_pil()
     return ctk.CTkImage(light_image=im, dark_image=im, size=(size, size))
 
 

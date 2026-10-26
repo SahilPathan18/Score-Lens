@@ -55,9 +55,9 @@ Write-Host ""
 Write-Host "=========================================="
 Write-Host "4. Packaging Portable Edition..."
 Write-Host "=========================================="
-Copy-Item -Path "dist/ResultAnalyzer" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
-Copy-Item -Path "assets" -Destination "dist/ResultAnalyzer-Portable/assets" -Recurse -Force
-Copy-Item -Path "src" -Destination "dist/ResultAnalyzer-Portable/src" -Recurse -Force
+Copy-Item -Path "dist/ResultAnalyzer/*" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
+Copy-Item -Path "assets" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
+Copy-Item -Path "src" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
 
 # Bundle signed Python runtime binaries
 Copy-Item -Path "C:\Python314\pythonw.exe" -Destination "dist/ResultAnalyzer-Portable/pythonw.exe" -Force
