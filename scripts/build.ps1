@@ -54,7 +54,7 @@ Write-Host "=========================================="
 Write-Host ""
 Write-Host "=========================================="
 Write-Host "4. Packaging Portable Edition..."
-Write-Host "=========================================="
+New-Item -ItemType Directory -Path "dist/ResultAnalyzer-Portable" -Force | Out-Null
 Copy-Item -Path "dist/ResultAnalyzer/*" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
 Copy-Item -Path "assets" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force
 Copy-Item -Path "src" -Destination "dist/ResultAnalyzer-Portable" -Recurse -Force

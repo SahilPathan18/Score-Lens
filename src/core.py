@@ -26,8 +26,8 @@ USN_RE = re.compile(
     r"U\d{2}[A-Z0-9]{1,6}\d{2}[A-Z0-9]{3,}|"  # Standard BU/VTU USN (e.g. U03LX23S0001)
     r"\d{2}[A-Z]{2,}\d{4,}|"                  # State university format (e.g. 21BCA0001)
     r"\d{7,14}|"                              # Numeric roll no (e.g. 21044570001, 12104562)
-    r"[A-Za-z]{2,5}\d{4,10}|"                 # Prefix alphanumeric (e.g. BCA2021001)
-    r"[A-Za-z0-9]{2,6}[/-][A-Za-z0-9]{1,6}[/-][A-Za-z0-9]{2,8}" # Slashed/hyphenated IDs (e.g. 21/BCA/042)
+    r"[A-Za-z]{2,5}\d{7,10}|"                 # Prefix alphanumeric (e.g. BCA2021001)
+    r"(?!\d{1,4}[/-]\d{1,2}[/-]\d{2,4}\b)\d{2,4}[/-][A-Za-z]{2,6}[/-][A-Za-z0-9]{2,8}" # Slashed IDs (e.g. 21/BCA/042)
     r")\b",
     re.I,
 )
@@ -74,12 +74,12 @@ def _extract_usn_year(usn: str) -> str | None:
     m = re.search(r"^(\d{2})[A-Za-z/]+", usn)
     if m:
         return m.group(1)
-    # 4-digit embedded year: CS-2023-101
-    m = re.search(r"(?:20)(\d{2})", usn)
-    if m:
-        return m.group(1)
     # Numeric roll number with year prefix (e.g. 21044570001)
     m = re.search(r"^([12]\d)\d{5,}$", usn)
+    if m:
+        return m.group(1)
+    # 4-digit embedded year: CS-2023-101 (standalone 4-digit year 20xx)
+    m = re.search(r"(?<!\d)20(\d{2})(?!\d)", usn)
     if m:
         return m.group(1)
     # Embedded 2-digit batch year: 22BCO101
@@ -336,19 +336,19 @@ def _parse_format_grid_table(doc: pymupdf.Document, pdf_path: str | Path) -> tup
         mapping = {"id": None, "name": None, "total": None, "result": None, "sgpa": None, "cgpa": None, "subjects": []}
         for c_idx, cell in enumerate(row):
             val = (cell or "").lower().strip().replace("\n", " ")
-            if any(k in val for k in ["usn", "reg", "roll", "seat", "enroll", "student id", "hall ticket", "prn", "ht no"]):
+            if mapping["id"] is None and re.search(r"\b(usn|reg(\.|\b)|roll|seat|enroll|student\s*id|hall\s*ticket|prn|ht\s*no)\b", val):
                 mapping["id"] = c_idx
-            elif any(k in val for k in ["name", "student", "candidate"]) and not any(k in val for k in ["father", "college", "institute"]):
+            elif mapping["name"] is None and re.search(r"\b(name|student|candidate)\b", val) and not re.search(r"\b(father|mother|college|institute|center)\b", val):
                 mapping["name"] = c_idx
-            elif any(k in val for k in ["grand total", "total marks", "tot marks", "total"]):
+            elif mapping["total"] is None and re.search(r"\b(grand\s*total|total\s*marks|tot\s*marks|total)\b", val):
                 mapping["total"] = c_idx
-            elif any(k in val for k in ["result", "status", "remarks"]):
+            elif mapping["result"] is None and re.search(r"\b(result|status|remarks)\b", val):
                 mapping["result"] = c_idx
-            elif "sgpa" in val or "gpa" in val or "spi" in val:
-                mapping["sgpa"] = c_idx
-            elif "cgpa" in val or "cpi" in val:
+            elif mapping["cgpa"] is None and re.search(r"\b(cgpa|cpi)\b", val):
                 mapping["cgpa"] = c_idx
-            elif len(val) >= 2 and not any(k in val for k in ["sl", "s.no", "sr.", "sr no", "serial"]):
+            elif mapping["sgpa"] is None and re.search(r"\b(sgpa|gpa|spi)\b", val):
+                mapping["sgpa"] = c_idx
+            elif len(val) >= 2 and not re.search(r"\b(sl(\.|\b)|s\.no|sr(\.|\b)|serial)\b", val):
                 clean_title = re.sub(r"\s+", " ", cell or "").strip()
                 if clean_title:
                     mapping["subjects"].append((c_idx, clean_title))
@@ -391,13 +391,14 @@ def _parse_format_grid_table(doc: pymupdf.Document, pdf_path: str | Path) -> tup
             for col_idx, sub_name in header_mapping["subjects"]:
                 if col_idx < len(row):
                     cell_val = str(row[col_idx] or "").strip()
-                    nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", cell_val)]
+                    nums = [float(n) for n in re.findall(r"\b\d{1,3}(?:\.\d+)?\b", cell_val)]
                     tot = nums[-1] if nums else None
                     if tot is not None:
                         row_marks.append(tot)
 
-                    is_fail = "F" in cell_val.upper() or (tot is not None and tot < 35)
-                    is_abs = "AB" in cell_val.upper() or cell_val.strip().upper() == "A"
+                    upper_val = cell_val.upper()
+                    is_fail = bool(re.search(r"\b(F|FAIL)\b", upper_val)) or (tot is not None and tot < 35)
+                    is_abs = (bool(re.search(r"\b(AB|ABS|ABSENT)\b", upper_val)) or cell_val.strip().upper() == "A") and not nums
                     if is_fail:
                         row_has_fail = True
 
@@ -423,7 +424,14 @@ def _parse_format_grid_table(doc: pymupdf.Document, pdf_path: str | Path) -> tup
             pct = round(grand_total / max_tot * 100, 2) if grand_total and max_tot else None
 
             # Result
-            overall_res = "FAIL" if row_has_fail else "PASS"
+            has_absent = any(s.get("status") == "ABSENT" for s in subjects_data.values())
+            all_absent = bool(subjects_data) and all(s.get("status") == "ABSENT" for s in subjects_data.values())
+            if all_absent:
+                overall_res = "ABSENT"
+            elif row_has_fail or has_absent:
+                overall_res = "FAIL"
+            else:
+                overall_res = "PASS"
             if header_mapping["result"] is not None and header_mapping["result"] < len(row):
                 res_val = str(row[header_mapping["result"]] or "").upper()
                 if "PASS" in res_val:
@@ -908,8 +916,8 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
         name_m = re.search(r"(?:Name|Student|Candidate)\s*[:\-]?\s*([A-Za-z\s.]{3,40})(?=\n|$)", block, re.I)
         name = clean_name(name_m.group(1)) if name_m else ""
 
-        sgpa_m = re.search(r"(?:SGPA|GPA|SPI)\s*[:\-]?\s*([\d.]+)", block, re.I)
-        cgpa_m = re.search(r"(?:CGPA|CPI)\s*[:\-]?\s*([\d.]+)", block, re.I)
+        sgpa_m = re.search(r"\b(?:SGPA|GPA|SPI)\s*[:\-]?\s*(\d+(?:\.\d+)?)", block, re.I)
+        cgpa_m = re.search(r"\b(?:CGPA|CPI)\s*[:\-]?\s*(\d+(?:\.\d+)?)", block, re.I)
         sgpa = float(sgpa_m.group(1)) if sgpa_m else None
         cgpa = float(cgpa_m.group(1)) if cgpa_m else None
 
@@ -920,11 +928,13 @@ def _parse_format_universal(pages: list[str], full_text: str, pdf_path: str | Pa
         for line in block.splitlines():
             m_sub = re.search(r"\b([A-Z0-9]{3,}-[A-Z0-9\-]+|[A-Z]{2,}\d+[A-Z0-9]*|[A-Z][A-Za-z\s]{3,24})\b", line)
             m_marks = re.findall(r"\b\d{1,3}\b", line)
+            if m_sub and re.match(r"(?i)\s*(s?gpa|cgpa|spi|cpi|total|grand|max|min|date|page|result|status|percentage)\b", m_sub.group(1)):
+                continue
             if m_sub and len(m_marks) >= 2:
                 c_code = m_sub.group(1).strip()
                 sub_tot = int(m_marks[-1])
                 sub_stat = "PASS" if "FAIL" not in line.upper() and sub_tot >= 35 else "FAIL"
-                if "AB" in line.upper() or line.strip().endswith(" A"):
+                if re.search(r"\b(AB|ABS|ABSENT)\b", line, re.I):
                     sub_stat = "ABSENT"
                 seen_courses[c_code] = c_code
                 subjects_data[c_code] = {
